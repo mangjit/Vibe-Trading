@@ -1,45 +1,52 @@
 # Vibe-Trading Android install notes
 
+## Correction noted
+You meant **uv**, not "cv".
+
+I updated the installer to support that directly.
+
 ## Recommended install target
 Use **Termux + `proot-distro` + a Debian/Ubuntu userspace**.
 
-Why this is the practical phone-first path:
+Why this is still the practical phone-first path:
 
 - The repo's local/full workflow pulls a large Python stack plus an optional React/Vite frontend that requires **Node >= 22.22.0**.
-- For Android, the hard part is not pure-Python packages; it is the current set of mandatory compiled transitive deps in the LangChain/OpenAI/LangGraph stack.
-- In a plain native Termux Python 3.14 environment, several important transitive packages currently have Linux aarch64 wheels but **not** Android wheels, which tends to force on-device Rust/C builds.
-- A Debian/Ubuntu userspace inside `proot-distro` can consume normal Linux aarch64 wheels, which keeps the install prebuilt-heavy and avoids the exact local build pressure you wanted to dodge.
+- For Android, the hard part is not pure-Python packages; it is the compiled transitive dependency chain behind the current runtime.
+- `uv` helps a lot with **speed**, environment management, and wheel-first installs, but it does **not** make missing Android wheels magically appear.
+- Inside a Debian/Ubuntu userspace, `uv` can consume normal Linux aarch64 wheels, which keeps the install much closer to your original goal: fewer local builds and less memory pressure.
 
-## Why not default to a pure native Termux install?
-I audited the current dependency path after reading the repo:
+## What changed
+`android/install_vibe_trading_android.sh` now supports:
 
-- **Base package metadata** requires `langchain`, `langchain-openai`, `langgraph`, `langgraph-checkpoint`, `pandas`, `numpy`, `scipy`, `pydantic`, market-data packages, API packages, and more.
-- The current transitive chain brings in packages such as `jiter`, `orjson`, and `ormsgpack`.
-- Some Android wheels do exist now for pieces like `aiohttp`, `curl_cffi`, `pypdfium2`, and `xxhash`.
-- But a lean native Termux install is still undermined by the remaining mandatory no-Android-wheel pieces, which means either:
-  1. building Rust/C extensions on the phone, or
-  2. pruning core dependencies hard enough that you stop matching the project's normal runtime.
+- `VT_PY_INSTALLER=uv` (default)
+- `VT_PY_INSTALLER=pip`
+- `VT_REFUSE_SOURCE_BUILDS=1` (default)
+- `VT_REFUSE_SOURCE_BUILDS=0` if you want to let the installer try source builds
 
-Because your goal was **minimum downloads, maximum reuse of prebuilt packages, and no heavy local compilation**, the `proot-distro` route is the best fit.
+So the default behavior is now:
 
-## What the installer script does
-`android/install_vibe_trading_android.sh`
+- use `uv`
+- prefer prebuilt wheels
+- fail rather than silently compile large source packages on-phone
 
+## What the installer does
 From Termux, it:
 
 1. installs `proot-distro`
 2. creates or reuses a Debian/Ubuntu container
-3. creates a Python venv inside that container
-4. installs a **curated phone-oriented dependency subset** with pip
-5. installs `vibe-trading-ai` itself with `--no-deps`
-6. writes Termux wrapper commands like:
+3. installs base packages in that container
+4. installs `uv` in the container by default
+5. creates a Python venv
+6. installs a curated Vibe-Trading dependency subset
+7. installs `vibe-trading-ai` itself with `--no-deps`
+8. writes Termux wrapper commands like:
    - `~/bin/vibe-trading-proot`
    - `~/bin/vibe-trading-shell-proot`
    - optionally `~/bin/vibe-trading-serve-proot`
    - optionally `~/bin/vibe-trading-mcp-proot`
 
 ## Default profile
-The script defaults to a lean profile for phone use:
+The script still defaults to a lean phone-oriented profile:
 
 - **included by default**
   - core agent/runtime stack
@@ -53,8 +60,6 @@ The script defaults to a lean profile for phone use:
   - DuckDB local-loader support
   - `aiohttp` async/channel support
   - frontend build
-
-That keeps the first install smaller while still preserving the core CLI + research/data path.
 
 ## Typical usage
 ```bash
@@ -70,6 +75,24 @@ vibe-trading-proot
 ```
 
 ## Useful toggles
+Use `uv` explicitly:
+
+```bash
+VT_PY_INSTALLER=uv ./android/install_vibe_trading_android.sh
+```
+
+If you want to let `uv` attempt source builds:
+
+```bash
+VT_PY_INSTALLER=uv VT_REFUSE_SOURCE_BUILDS=0 ./android/install_vibe_trading_android.sh
+```
+
+If you want the old pip path instead:
+
+```bash
+VT_PY_INSTALLER=pip ./android/install_vibe_trading_android.sh
+```
+
 Enable the API surface:
 
 ```bash
@@ -100,12 +123,13 @@ Use a shallow git clone instead of PyPI:
 VT_SOURCE=git ./android/install_vibe_trading_android.sh
 ```
 
-## Scope decisions baked into this installer
-- **No on-device frontend build by default.** The repo's frontend requires Node 22+, which is exactly the kind of extra download/build surface that is painful on phones.
-- **Install only the packages that are actually useful for phone-first CLI/API use.** Optional stacks are kept behind flags.
-- **Prefer prebuilt packages over local compilation.** This is the main reason the script targets a Debian/Ubuntu userspace rather than raw Termux Python.
+## Scope decisions still baked into this installer
+- **No on-device frontend build by default.**
+- **Install only the packages useful for phone-first CLI/API use.**
+- **Use uv by default, but still treat large source builds as opt-in.**
+- **Keep the most reliable path centered on prebuilt Linux arm64 wheels inside proot.**
 
-## Relevant upstream facts
+## Relevant upstream docs
 - Termux package repositories: https://packages.termux.dev/
 - TUR overview and precompiled package index:
   - https://deepwiki.com/termux-user-repository/tur/1.2-getting-started
@@ -114,9 +138,12 @@ VT_SOURCE=git ./android/install_vibe_trading_android.sh
 - `proot-distro` docs:
   - https://wiki.termux.com/wiki/PRoot?amp=1
   - https://github.com/termux/proot-distro
+- `uv` docs:
+  - https://docs.astral.sh/uv/reference/cli/
+  - https://docs.astral.sh/uv/pip/compatibility/
 - PyPI package page:
   - https://pypi.org/project/vibe-trading-ai/
 
-## Files created
+## Files
 - `android/install_vibe_trading_android.sh`
 - `android/ANDROID_INSTALL_NOTES.md`

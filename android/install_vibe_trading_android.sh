@@ -3,17 +3,22 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # Vibe-Trading Android installer
-# Recommended target: Termux + proot-distro (Debian/Ubuntu userspace)
-# Why: it lets pip use standard Linux aarch64 wheels for the current Vibe-Trading
-# stack, which avoids several Rust/C local builds that are awkward on-phone.
+# Recommended target: Termux + proot-distro + Debian/Ubuntu userspace.
+# Default Python installer: uv, because it is fast and can be told to refuse
+# source builds. That keeps the install aligned with the original goal of
+# preferring prebuilt wheels over on-phone compilation.
 
 VT_CONTAINER="${VT_CONTAINER:-vibe-trading}"
 VT_DISTRO="${VT_DISTRO:-debian}"
-VT_SOURCE="${VT_SOURCE:-pypi}"           # pypi | git
+VT_SOURCE="${VT_SOURCE:-pypi}"                 # pypi | git
 VT_PACKAGE_SPEC="${VT_PACKAGE_SPEC:-vibe-trading-ai==0.1.14}"
 VT_REPO_URL="${VT_REPO_URL:-https://github.com/HKUDS/Vibe-Trading.git}"
 VT_APP_DIR="${VT_APP_DIR:-/root/Vibe-Trading}"
 VT_VENV="${VT_VENV:-/opt/vibe-trading-venv}"
+VT_PY_INSTALLER="${VT_PY_INSTALLER:-uv}"       # uv | pip
+VT_REFUSE_SOURCE_BUILDS="${VT_REFUSE_SOURCE_BUILDS:-1}"
+VT_UV_INSTALL_DIR="${VT_UV_INSTALL_DIR:-/usr/local/bin}"
+VT_UV_INSTALLER_URL="${VT_UV_INSTALLER_URL:-https://astral.sh/uv/install.sh}"
 
 # Feature flags: defaults are intentionally lean for phone use.
 VT_WITH_MARKET="${VT_WITH_MARKET:-1}"
@@ -45,6 +50,10 @@ ensure_termux() {
   case "${VT_DISTRO}" in
     debian|debian:*|ubuntu|ubuntu:* ) ;;
     * ) die "VT_DISTRO=${VT_DISTRO} is not supported by this script. Use a Debian/Ubuntu container." ;;
+  esac
+  case "${VT_PY_INSTALLER}" in
+    uv|pip ) ;;
+    * ) die "VT_PY_INSTALLER=${VT_PY_INSTALLER} is not supported. Use uv or pip." ;;
   esac
 }
 
@@ -84,6 +93,10 @@ run_container_setup() {
     VT_REPO_URL="$VT_REPO_URL" \
     VT_APP_DIR="$VT_APP_DIR" \
     VT_VENV="$VT_VENV" \
+    VT_PY_INSTALLER="$VT_PY_INSTALLER" \
+    VT_REFUSE_SOURCE_BUILDS="$VT_REFUSE_SOURCE_BUILDS" \
+    VT_UV_INSTALL_DIR="$VT_UV_INSTALL_DIR" \
+    VT_UV_INSTALLER_URL="$VT_UV_INSTALLER_URL" \
     VT_WITH_MARKET="$VT_WITH_MARKET" \
     VT_WITH_DOCS="$VT_WITH_DOCS" \
     VT_WITH_API="$VT_WITH_API" \
@@ -109,6 +122,10 @@ BASE_APT=(
   python3-pip
 )
 
+if [ "$VT_PY_INSTALLER" = "uv" ]; then
+  BASE_APT+=(curl)
+fi
+
 if [ "$VT_SOURCE" = "git" ]; then
   BASE_APT+=(git)
 fi
@@ -132,12 +149,78 @@ if [ "$VT_WITH_REPORTS" = "1" ]; then
   apt-get install -y --no-install-recommends "${REPORT_APT[@]}"
 fi
 
-mkdir -p "$(dirname "$VT_VENV")"
-python3 -m venv "$VT_VENV"
-. "$VT_VENV/bin/activate"
+install_uv() {
+  if command -v uv >/dev/null 2>&1; then
+    return
+  fi
+  log "Installing uv"
+  INSTALLER_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$VT_UV_INSTALL_DIR" \
+    sh -c "
+      set -e
+      curl -LsSf '$VT_UV_INSTALLER_URL' | sh
+    "
+}
 
-log "Upgrading pip/setuptools/wheel"
-python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+create_venv() {
+  mkdir -p "$(dirname "$VT_VENV")"
+  case "$VT_PY_INSTALLER" in
+    uv)
+      install_uv
+      uv venv --python python3 "$VT_VENV"
+      ;;
+    pip)
+      python3 -m venv "$VT_VENV"
+      ;;
+    *)
+      echo "Unsupported VT_PY_INSTALLER=$VT_PY_INSTALLER" >&2
+      exit 1
+      ;;
+  esac
+}
+
+py_install() {
+  local -a args
+  case "$VT_PY_INSTALLER" in
+    uv)
+      args=(uv pip install --python "$VT_VENV/bin/python")
+      if [ "$VT_REFUSE_SOURCE_BUILDS" = "1" ]; then
+        args+=(--no-build)
+      fi
+      "${args[@]}" "$@"
+      ;;
+    pip)
+      if [ "$VT_REFUSE_SOURCE_BUILDS" = "1" ]; then
+        "$VT_VENV/bin/python" -m pip install --no-cache-dir --only-binary=:all: "$@"
+      else
+        "$VT_VENV/bin/python" -m pip install --no-cache-dir "$@"
+      fi
+      ;;
+  esac
+}
+
+py_install_local() {
+  case "$VT_PY_INSTALLER" in
+    uv)
+      # First-party/local projects may still be built by uv even with --no-build.
+      uv pip install --python "$VT_VENV/bin/python" --no-deps "$1"
+      ;;
+    pip)
+      "$VT_VENV/bin/python" -m pip install --no-cache-dir --no-deps "$1"
+      ;;
+  esac
+}
+
+create_venv
+
+log "Bootstrapping packaging tools"
+case "$VT_PY_INSTALLER" in
+  uv)
+    uv pip install --python "$VT_VENV/bin/python" pip setuptools wheel
+    ;;
+  pip)
+    "$VT_VENV/bin/python" -m pip install --no-cache-dir --upgrade pip setuptools wheel
+    ;;
+esac
 
 PACKAGES=(
   'rich>=13.0.0'
@@ -225,13 +308,20 @@ if [ "$VT_WITH_AIOHTTP" = "1" ]; then
   )
 fi
 
-log "Installing curated Python dependency set"
-python -m pip install --no-cache-dir "${PACKAGES[@]}"
+log "Installing curated Python dependency set via $VT_PY_INSTALLER"
+py_install "${PACKAGES[@]}"
 
 case "$VT_SOURCE" in
   pypi)
     log "Installing Vibe-Trading from PyPI: $VT_PACKAGE_SPEC"
-    python -m pip install --no-cache-dir --no-deps "$VT_PACKAGE_SPEC"
+    case "$VT_PY_INSTALLER" in
+      uv)
+        uv pip install --python "$VT_VENV/bin/python" --no-deps "$VT_PACKAGE_SPEC"
+        ;;
+      pip)
+        "$VT_VENV/bin/python" -m pip install --no-cache-dir --no-deps "$VT_PACKAGE_SPEC"
+        ;;
+    esac
     ;;
   git)
     log "Installing Vibe-Trading from git: $VT_REPO_URL"
@@ -242,7 +332,7 @@ case "$VT_SOURCE" in
       git -C "$VT_APP_DIR" fetch --depth 1 origin
       git -C "$VT_APP_DIR" pull --ff-only
     fi
-    python -m pip install --no-cache-dir --no-deps "$VT_APP_DIR"
+    py_install_local "$VT_APP_DIR"
     ;;
   *)
     echo "Unsupported VT_SOURCE=$VT_SOURCE" >&2
@@ -251,11 +341,14 @@ case "$VT_SOURCE" in
 esac
 
 apt-get clean
-rm -rf /var/lib/apt/lists/* ~/.cache/pip
+rm -rf /var/lib/apt/lists/* ~/.cache/pip ~/.cache/uv
 
 log "Done"
-python --version
-python -m pip show vibe-trading-ai | sed -n '1,8p'
+"$VT_VENV/bin/python" --version
+"$VT_VENV/bin/python" - <<'PY'
+from importlib import metadata
+print('vibe-trading-ai', metadata.version('vibe-trading-ai'))
+PY
 EOF
 }
 
@@ -332,6 +425,8 @@ EOF
 Current options:
   VT_DISTRO=$VT_DISTRO
   VT_SOURCE=$VT_SOURCE
+  VT_PY_INSTALLER=$VT_PY_INSTALLER
+  VT_REFUSE_SOURCE_BUILDS=$VT_REFUSE_SOURCE_BUILDS
   VT_WITH_MARKET=$VT_WITH_MARKET
   VT_WITH_DOCS=$VT_WITH_DOCS
   VT_WITH_API=$VT_WITH_API
@@ -343,6 +438,9 @@ Current options:
 
 Notes:
   - Frontend/Node build is intentionally skipped for phone installs.
+  - Default installer is uv.
+  - VT_REFUSE_SOURCE_BUILDS=1 keeps the install wheel-only where possible.
+  - If you explicitly want uv/pip to attempt source builds, re-run with VT_REFUSE_SOURCE_BUILDS=0.
   - Re-run this script with VT_WITH_REPORTS=1 if you later need WeasyPrint/matplotlib report output.
   - Re-run with VT_WITH_ML=1 if you later need scikit-learn/bottleneck-based features.
 EOF
